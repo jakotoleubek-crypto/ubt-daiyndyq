@@ -70,6 +70,10 @@ input[type=text]{width:100%;margin-bottom:12px;background:var(--bg);color:var(--
 .tr{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:12px 0;border-top:1px solid var(--line)}
 .tr:first-child{border-top:0}.acts{display:flex;gap:8px;flex:none}
 .cn{font-size:.85rem;color:var(--mut)}
+.board{margin-top:24px}
+.board-item{padding:10px 0;border-top:1px solid var(--line)}
+.board-item:first-child{border-top:0}
+.board-item small{display:block;color:var(--mut)}
 h3{margin:0 0 4px;font-size:1.05rem}
 button:focus-visible,input:focus-visible,textarea:focus-visible{outline:2px solid var(--blue);outline-offset:2px}
 @media(max-width:520px){.card{padding:16px}.row .btn{flex:1}}
@@ -77,8 +81,13 @@ button:focus-visible,input:focus-visible,textarea:focus-visible{outline:2px soli
 </head>
 <body>
 <div class="w" id="app"></div>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
 <script>
-const app=document.getElementById('app'),L='ABCDEFGHIJKLMNOP',KEY='ubt:session';
+const app=document.getElementById('app'),L='ABCDEFGHIJKLMNOP';
+const FIREBASE_CONFIG={apiKey:'',authDomain:'',projectId:'',appId:''};
+const FIREBASE_CONFIGURED=Object.values(FIREBASE_CONFIG).every(v=>v&&v.trim());
 const svg=p=>`<svg viewBox="0 0 24 24" aria-hidden="true">${p}</svg>`;
 const SUBJ=[
 {id:'kh',name:'Қазақстан тарихы',ic:svg('<path d="M3 20h18M5 20V10M9.7 20V10M14.3 20V10M19 20V10M3 10l9-6 9 6"/>')},
@@ -98,52 +107,76 @@ const fmt=s=>String(Math.floor(s/60)).padStart(2,'0')+':'+String(s%60).padStart(
 const same=(a,b)=>a.length===b.length&&[...a].sort().every((x,i)=>x===b[i]);
 const lget=k=>{try{return JSON.parse(localStorage.getItem(k))}catch(e){return null}};
 const lset=(k,v)=>{try{localStorage.setItem(k,JSON.stringify(v))}catch(e){}};
-let S=lget('ubt:session')||{view:'home'},TESTS=lget('ubt:tests')||[],DB=null,UID=null,ready=false,loaded=false,warned=false,armed=null,tmr;
+let S=lget('ubt:session')||{view:'home'},TESTS=lget('ubt:tests')||[],DB=null,UID=null,ready=false,loaded=false,warned=false,armed=null,cloudError='',SHARED_RESULTS=[],RESULTS_ERROR='',publishing=false;
 const sub=()=>SUBJ.find(s=>s.id===S.sid);
 const cur=()=>TESTS.find(t=>t.id===S.tid);
 const QS=()=>cur().qs;
 const $=q=>document.querySelector(q);
-function save(){S.ts=Date.now();lset('ubt:session',S);clearTimeout(tmr);tmr=setTimeout(()=>{if(DB&&UID)DB.doc('data/users/'+UID+'/session').set(JSON.parse(JSON.stringify(S))).catch(()=>{})},500)}
+function save(){S.ts=Date.now();lset('ubt:session',S)}
 if(S.view!=='home'&&!sub())S={view:'home'};
 const elapsed=()=>S.view==='result'?S.time:Math.floor((Date.now()-S.t0)/1000);
 const score=()=>QS().reduce((n,q,i)=>n+(same(S.ans[i]||[],q.correct)?1:0),0);
 const err=m=>`<div class="err">${esc(m)}</div>`;
+function validTest(t){
+  return t&&typeof t.ownerUid==='string'&&typeof t.title==='string'&&t.title.length>0&&t.title.length<=120&&SUBJ.some(s=>s.id===t.sid)&&Number.isSafeInteger(t.ts)&&Array.isArray(t.qs)&&t.qs.length>0&&t.qs.length<=300&&t.qs.every(q=>q&&typeof q.question==='string'&&q.question.trim().length>0&&q.question.length<=1000&&Array.isArray(q.options)&&q.options.length>=2&&q.options.length<=L.length&&q.options.every(o=>typeof o==='string'&&o.length<=500)&&Array.isArray(q.correct)&&q.correct.length>0&&q.correct.length<=q.options.length&&new Set(q.correct).size===q.correct.length&&q.correct.every(i=>Number.isInteger(i)&&i>=0&&i<q.options.length));
+}
+
 async function addTest(title,qs){
   const t={sid:S.sid,title,qs,ts:Date.now()};
-  try{if(!DB)throw 0;t.id=(await DB.collection('tests').add(t)).id}catch(e){t.id='l'+Date.now()}
+  if(DB&&UID){
+    try{t.ownerUid=UID;t.id=(await DB.collection('tests').add(t)).id;cloudError=''}
+    catch(e){cloudError='Cloud save failed; this test is stored on this device only.';delete t.ownerUid;t.id='l'+Date.now()}
+  }else t.id='l'+Date.now();
   if(!TESTS.some(x=>x.id===t.id))TESTS.push(t);
   lset('ubt:tests',TESTS);return t.id;
 }
-function delTest(id){
+async function delTest(id){
+  const t=TESTS.find(x=>x.id===id);
+  if(DB&&t&&t.id[0]!=='l'&&t.ownerUid!==UID)return;
+  if(DB&&t&&t.id[0]!=='l'){
+    try{await DB.doc('tests/'+id).delete()}
+    catch(e){cloudError='Could not delete the shared test.';setSync();return}
+  }
   TESTS=TESTS.filter(t=>t.id!==id);lset('ubt:tests',TESTS);
-  if(DB&&id[0]!=='l')DB.doc('tests/'+id).delete().catch(()=>{});
 }
 
 function parse(t){
+  if(t.length>500000)throw new Error('Question JSON is too large (maximum 500 KB).');
   let d;
   try{d=JSON.parse(t)}catch(e){
     try{d=JSON.parse(t.replace(/^\s*\/\/.*$/gm,'').replace(/([\]"\d])[ \t]*\/\/[^\n]*/g,'$1').replace(/,\s*([\]}])/g,'$1'))}
     catch(e2){throw new Error('JSON форматы қате, тексеріп қайта енгізіңіз.')}
   }
   if(!Array.isArray(d)||!d.length)throw new Error('JSON — бос емес сұрақтар тізімі [ ... ] болуы керек.');
+  if(d.length>300)throw new Error('A test can contain at most 300 questions.');
   return d.map((q,i)=>{
     const n=i+1;
+    if(q&&typeof q.question==='string'&&q.question.length>1000)throw new Error('Question text must be at most 1000 characters.');
     if(!q||typeof q.question!=='string'||!q.question.trim())throw new Error(`${n}-сұрақта «question» мәтіні жоқ.`);
     if(!Array.isArray(q.options)||q.options.length<2||q.options.length>L.length)throw new Error(`${n}-сұрақта «options» кемінде 2 жауап нұсқасынан тұруы керек.`);
+    if(q.options.some(o=>String(o).length>500))throw new Error('Answer options must be at most 500 characters.');
     const c=Array.isArray(q.correct)?q.correct:[q.correct];
     if(!c.length||c.some(x=>!Number.isInteger(x)||x<0||x>=q.options.length))throw new Error(`${n}-сұрақта «correct» индекстері қате (0-ден ${q.options.length-1}-ге дейін болуы керек).`);
     return{question:q.question,options:q.options.map(String),correct:[...new Set(c)].sort((a,b)=>a-b)};
   });
 }
 
+function resultsList(){
+  if(!FIREBASE_CONFIGURED)return '<p class="hint">Firebase is not configured; shared results are unavailable.</p>';
+  if(!ready)return '<p class="hint">Loading shared results...</p>';
+  if(RESULTS_ERROR)return `<p class="hint">${esc(RESULTS_ERROR)}</p>`;
+  if(!SHARED_RESULTS.length)return '<p class="hint">No results have been published yet.</p>';
+  return SHARED_RESULTS.map(r=>`<div class="board-item"><b>${esc(r.nickname)}</b> - ${esc(r.testTitle)}: ${r.score}/${r.total} (${r.percent}%)<small>${esc((SUBJ.find(s=>s.id===r.sid)||{name:r.sid}).name)}${r.createdAt&&r.createdAt.toDate?' | '+esc(r.createdAt.toDate().toLocaleString('kk-KZ')):''}</small></div>`).join('');
+}
 function home(){
   app.innerHTML=`<div class="top"><span class="brand">ҰБТ дайындық</span><span class="sync" id="sync"></span></div>
   <h1>ҰБТ-ға дайындық платформасы</h1>
   <p class="lead">Пәнді таңдап, өз сұрақтар базаңды JSON түрінде жүктеңіз де, тестті уақытпен тапсырып, қателермен жұмыс жасаңыз.</p>
   <div class="grid">${SUBJ.map(s=>`<button class="sc" data-s="${s.id}"><span class="ic">${s.ic}</span><b>${s.name}</b><span class="cn">Тесттер: ${TESTS.filter(t=>t.sid===s.id).length}</span><span class="go">Тестке өту</span></button>`).join('')}</div>`;
+  app.innerHTML+='<section class="card board"><h2>&#1054;&#1088;&#1090;&#1072;&#1179; &#1085;&#1241;&#1090;&#1080;&#1078;&#1077; &#1090;&#1072;&#1179;&#1090;&#1072;&#1089;&#1099;</h2><div id="results">'+resultsList()+'</div></section>';
 }
 
-const list=()=>{const a=TESTS.filter(t=>t.sid===S.sid).sort((x,y)=>x.ts-y.ts);return a.length?a.map(t=>`<div class="tr"><span><b>${esc(t.title)}</b><br><small class="mut">${t.qs.length} сұрақ</small></span><span class="acts"><button class="btn sm" data-b="${t.id}">Бастау</button><button class="btn ghost sm" data-d="${t.id}">${armed===t.id?'Растау':'Өшіру'}</button></span></div>`).join(''):'<p class="hint">Әзірге тест жоқ. Төмендегі формаға тақырып атын жазып, JSON қойыңыз.</p>'};
+const list=()=>{const a=TESTS.filter(t=>t.sid===S.sid).sort((x,y)=>x.ts-y.ts);return a.length?a.map(t=>`<div class="tr"><span><b>${esc(t.title)}</b><br><small class="mut">${t.qs.length} &#1089;&#1201;&#1088;&#1072;&#1179;</small></span><span class="acts"><button class="btn sm" data-b="${esc(t.id)}">&#1041;&#1072;&#1089;&#1090;&#1072;&#1091;</button>${!DB||t.id[0]==='l'||t.ownerUid===UID?`<button class="btn ghost sm" data-d="${esc(t.id)}">${armed===t.id?'&#1056;&#1072;&#1089;&#1090;&#1072;&#1091;':'&#1256;&#1096;&#1110;&#1088;&#1091;'}</button>`:''}</span></div>`).join(''):'<p class="hint">No tests yet. Add a title and JSON question list below.</p>'};
 const renderList=()=>{const l=$('#list');if(l)l.innerHTML=list()};
 function subject(){
   const d=S.draft&&S.draft.sid===S.sid?S.draft:{t:'',j:''};
@@ -161,7 +194,7 @@ function subject(){
 
 function test(){
   const Q=QS(),q=Q[S.cur],a=S.ans[S.cur]||[],m=q.correct.length>1,last=S.cur===Q.length-1;
-  app.innerHTML=`<div class="top"><span><b>${esc(cur().title)}</b><br><small class="mut">${sub().name}</small></span><span class="timer" id="tm" aria-label="Өткен уақыт">${fmt(elapsed())}</span></div>
+  app.innerHTML=`<div class="top"><span><b>${esc(cur().title)}</b><br><small class="mut">${sub().name}</small></span><span><span class="timer" id="tm" aria-label="Өткен уақыт">${fmt(elapsed())}</span><br><span class="sync" id="sync"></span></span></div>
   <nav class="nav" aria-label="Сұрақтар">${Q.map((_,i)=>`<button class="n${i===S.cur?' cur':''}${(S.ans[i]||[]).length?' done':''}" data-n="${i}" aria-label="${i+1}-сұрақ">${i+1}</button>`).join('')}</nav>
   <section class="card"><p class="cnt">${S.cur+1} / ${Q.length}</p><h2>${esc(q.question)}</h2>
   ${m?'<p class="hint">Бірнеше жауап таңдаңыз.</p>':''}
@@ -172,10 +205,15 @@ function test(){
 
 function result(){
   const Q=QS(),sc=score(),t=Q.length,p=Math.round(sc/t*100),sec=S.time;
+  const publishStatus=!FIREBASE_CONFIGURED?'<p class="hint">Firebase is not configured; public publishing is unavailable.</p>':!ready?'<p class="hint">Connecting to Firebase...</p>':!DB?`<p class="hint">${esc(cloudError||'Cloud publishing is unavailable.')}</p>`:S.published?'<p class="note">&#1053;&#1241;&#1090;&#1080;&#1078;&#1077; &#1086;&#1088;&#1090;&#1072;&#1179; &#1090;&#1072;&#1179;&#1090;&#1072;&#1171;&#1072; &#1078;&#1072;&#1088;&#1080;&#1103;&#1083;&#1072;&#1085;&#1076;&#1099;.</p>':'';
   app.innerHTML=`<div class="top"><span class="brand">${esc(cur().title)}</span></div>
   <h1>Тест нәтижесі</h1>
   <div class="card"><div class="res"><div class="pct">${p}%</div><p class="stat"><b>${sc} / ${t}</b>жинаған балл</p><p class="stat"><b>${Math.floor(sec/60)} мин ${sec%60} сек</b>жұмсалған уақыт</p></div>
   <div class="bar" role="progressbar" aria-valuenow="${p}" aria-valuemin="0" aria-valuemax="100"><i style="width:${p}%"></i></div></div>
+  <section class="card" style="margin-top:16px"><h2>&#1053;&#1241;&#1090;&#1080;&#1078;&#1077;&#1085;&#1110; &#1086;&#1088;&#1090;&#1072;&#1179; &#1090;&#1072;&#1179;&#1090;&#1072;&#1171;&#1072; &#1078;&#1072;&#1088;&#1080;&#1103;&#1083;&#1072;&#1091;</h2><p class="hint">&#1053;&#1241;&#1090;&#1080;&#1078;&#1077;&#1187;&#1110;&#1079; &#1083;&#1072;&#1179;&#1072;&#1087; &#1072;&#1090;&#1099;&#1187;&#1099;&#1079;&#1073;&#1077;&#1085; &#1073;&#1072;&#1088;&#1083;&#1099;&#1171;&#1099;&#1085;&#1072; &#1082;&#1257;&#1088;&#1110;&#1085;&#1077;&#1076;&#1110;.</p>
+  <input type="text" id="nickname" maxlength="24" autocomplete="nickname" placeholder="&#1051;&#1072;&#1179;&#1072;&#1087; &#1072;&#1090;&#1099;&#1187;&#1099;&#1079;" aria-label="&#1051;&#1072;&#1179;&#1072;&#1087; &#1072;&#1090;&#1099;&#1187;&#1099;&#1079;" value="${esc(lget('ubt:nickname')||'')}">
+  <div id="publishmsg" role="status">${publishStatus}</div>
+  <button class="btn" id="publish"${!FIREBASE_CONFIGURED||!ready||!DB||S.published?' disabled':''}>&#1054;&#1088;&#1090;&#1072;&#1179; &#1090;&#1072;&#1179;&#1090;&#1072;&#1171;&#1072; &#1078;&#1072;&#1088;&#1080;&#1103;&#1083;&#1072;&#1091;</button></section>
   <div class="row"><button class="btn" id="retry">Қайта тапсыру</button><button class="btn ghost" id="home">Басты бетке оралу</button></div>
   <h2 style="margin-top:36px">Қатемен жұмыс</h2>
   ${Q.map((q,i)=>{
@@ -194,7 +232,7 @@ function render(){
   }
   ({home,subject,test,result})[S.view]();setSync();window.scrollTo(0,0);
 }
-function setSync(){const e=$('#sync');if(e)e.textContent=!ready?'':DB?'Ортақ база қосулы':'Тесттер осы құрылғыда сақталады'}
+function setSync(){const e=$('#sync');if(e)e.textContent=!ready?'':cloudError||(DB?'Shared database connected':'Firebase not configured - saved on this device')}
 function refresh(){
   if(S.view==='home')home(),setSync();
   else if(S.view==='subject')renderList();
@@ -203,12 +241,25 @@ function refresh(){
 function begin(id){S={view:'test',sid:S.sid,tid:id,ans:{},cur:0,t0:Date.now()};save();warned=false;render()}
 async function submit(go){
   const ti=$('#title').value.trim(),m=$('#msg');
-  if(!ti){m.innerHTML=err('Тақырыптың атын жазыңыз.');return}
+  if(!ti||ti.length>120){m.innerHTML=err('Enter a title of 1-120 characters.');return}
   let qs;try{qs=parse($('#json').value)}catch(x){m.innerHTML=err(x.message);return}
   const id=await addTest(ti,qs);S.draft=null;
   if(go)return begin(id);
   $('#title').value='';$('#json').value='';save();renderList();
   m.innerHTML=`<div class="note">«${esc(ti)}» сақталды.</div>`;
+}
+
+async function publishResult(){
+  const input=$('#nickname'),message=$('#publishmsg'),nickname=input.value.trim();
+  if(!DB||!UID){message.innerHTML=err('Shared storage is not connected.');return}
+  if(nickname.length<2||nickname.length>24||/[\u0000-\u001f\u007f]/.test(nickname)){message.innerHTML=err('Nickname must be 2-24 characters and contain no control characters.');return}
+  if(publishing)return;publishing=true;$('#publish').disabled=true;message.textContent='Publishing...';
+  const total=QS().length,points=score();
+  try{
+    await DB.collection('results').add({ownerUid:UID,nickname,testId:S.tid,testTitle:cur().title,sid:S.sid,score:points,total,percent:Math.round(points/total*100),timeSeconds:S.time,createdAt:firebase.firestore.FieldValue.serverTimestamp()});
+    lset('ubt:nickname',nickname);S.published=true;save();message.innerHTML='<p class="note">&#1053;&#1241;&#1090;&#1080;&#1078;&#1077; &#1086;&#1088;&#1090;&#1072;&#1179; &#1090;&#1072;&#1179;&#1090;&#1072;&#1171;&#1072; &#1078;&#1072;&#1088;&#1080;&#1103;&#1083;&#1072;&#1085;&#1076;&#1099;.</p>';
+  }catch(e){cloudError='Result could not be saved to the cloud.';message.innerHTML=err(cloudError);setSync();$('#publish').disabled=false}
+  finally{publishing=false}
 }
 
 app.addEventListener('click',e=>{
@@ -221,6 +272,7 @@ app.addEventListener('click',e=>{
   armed=null;
   if(b.dataset.s){S={view:'subject',sid:b.dataset.s};save();render()}
   else if(b.dataset.b)begin(b.dataset.b);
+  else if(id==='publish')publishResult();
   else if(id==='home'||id==='home2'){S={view:'home'};save();render()}
   else if(id==='sample'){
     const j=JSON.stringify(SAMPLE,null,2);
@@ -258,29 +310,31 @@ app.addEventListener('change',e=>{
 setInterval(()=>{const t=document.getElementById('tm');if(t&&S.view==='test')t.textContent=fmt(elapsed())},1000);
 render();
 (async()=>{
-  let applied=false;
+  if(!FIREBASE_CONFIGURED){ready=true;render();return}
   try{
-    const c=window.claude;
-    if(c&&c.use){
-      DB=await Promise.race([c.use('db'),new Promise(r=>setTimeout(()=>r(null),10000))]);
-      if(DB){const u=await c.use('user');UID=u?await u.id():null}
-    }
-  }catch(e){DB=null}
-  if(DB&&UID){
-    try{
-      const d=await DB.doc('data/users/'+UID+'/session').get(),r=d.exists&&d.data();
-      if(r&&r.view&&r.ts>(S.ts||0)){S=r;lset('ubt:session',S);applied=true}else save();
-    }catch(e){}
-  }
-  ready=true;
-  if(DB){
+    if(!window.firebase)throw new Error('Firebase SDK failed to load');
+    firebase.initializeApp(FIREBASE_CONFIG);
+    const auth=firebase.auth();
+    const currentUser=await new Promise((resolve,reject)=>{
+      const unsubscribe=auth.onAuthStateChanged(user=>{unsubscribe();resolve(user)},error=>{unsubscribe();reject(error)});
+    });
+    if(!currentUser)await auth.signInAnonymously();
+    UID=auth.currentUser.uid;
+    DB=firebase.firestore();
     DB.collection('tests').onSnapshot(sn=>{
-      TESTS=[...sn.docs.map(d=>({...d.data(),id:d.id})),...TESTS.filter(t=>t.id[0]==='l')].sort((x,y)=>x.ts-y.ts);
-      lset('ubt:tests',TESTS);loaded=true;refresh();
-    },()=>{loaded=true;refresh()});
-    setTimeout(()=>{if(!loaded){loaded=true;refresh()}},10000);
+      const cloudTests=sn.docs.map(d=>({...d.data(),id:d.id})).filter(validTest);
+      TESTS=[...cloudTests,...TESTS.filter(t=>t.id[0]==='l')].sort((x,y)=>x.ts-y.ts);
+      lset('ubt:tests',TESTS);loaded=true;cloudError='';
+      if(S.view==='home'||S.view==='subject'||(['test','result'].includes(S.view)&&!cur()))refresh();
+    },e=>{cloudError='Could not load shared tests.';loaded=true;if(S.view==='home'||S.view==='subject')refresh();else setSync()});
+    DB.collection('results').orderBy('createdAt','desc').onSnapshot(sn=>{
+      SHARED_RESULTS=sn.docs.map(d=>d.data());RESULTS_ERROR='';
+      if(S.view==='home')refresh();
+    },e=>{RESULTS_ERROR='Could not load shared results.';if(S.view==='home')refresh()});
+    ready=true;refresh();
+  }catch(e){
+    DB=null;UID=null;cloudError='Firebase connection failed. Tests remain on this device.';ready=true;render();
   }
-  if(applied||!DB||S.view==='test'||S.view==='result')render();else refresh();
 })();
 </script>
 </body>

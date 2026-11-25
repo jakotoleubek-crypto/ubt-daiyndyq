@@ -1,0 +1,71 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function ownsWrite() {
+      return signedIn() && request.resource.data.ownerUid == request.auth.uid;
+    }
+
+    function validSubject(value) {
+      return value in ['kh', 'dh', 'ms', 'm', 'inf', 'en'];
+    }
+
+    match /tests/{testId} {
+      allow read: if signedIn();
+      allow create: if ownsWrite()
+        && request.resource.data.keys().hasAll(['ownerUid', 'sid', 'title', 'qs', 'ts'])
+        && request.resource.data.keys().hasOnly(['ownerUid', 'sid', 'title', 'qs', 'ts'])
+        && validSubject(request.resource.data.sid)
+        && request.resource.data.title is string
+        && request.resource.data.title.size() > 0
+        && request.resource.data.title.size() <= 120
+        && request.resource.data.qs is list
+        && request.resource.data.qs.size() > 0
+        && request.resource.data.qs.size() <= 300
+        && request.resource.data.ts is int;
+      allow delete: if signedIn() && resource.data.ownerUid == request.auth.uid;
+    }
+
+    match /results/{resultId} {
+      allow read: if signedIn();
+      allow create: if ownsWrite()
+        && request.resource.data.keys().hasAll([
+          'ownerUid', 'nickname', 'testId', 'testTitle', 'sid',
+          'score', 'total', 'percent', 'timeSeconds', 'createdAt'
+        ])
+        && request.resource.data.keys().hasOnly([
+          'ownerUid', 'nickname', 'testId', 'testTitle', 'sid',
+          'score', 'total', 'percent', 'timeSeconds', 'createdAt'
+        ])
+        && request.resource.data.nickname is string
+        && request.resource.data.nickname.size() >= 2
+        && request.resource.data.nickname.size() <= 24
+        && request.resource.data.testId is string
+        && request.resource.data.testId.size() <= 128
+        && request.resource.data.testTitle is string
+        && request.resource.data.testTitle.size() > 0
+        && request.resource.data.testTitle.size() <= 120
+        && validSubject(request.resource.data.sid)
+        && request.resource.data.score is int
+        && request.resource.data.total is int
+        && request.resource.data.total > 0
+        && request.resource.data.total <= 300
+        && request.resource.data.score >= 0
+        && request.resource.data.score <= request.resource.data.total
+        && request.resource.data.percent is int
+        && request.resource.data.percent >= 0
+        && request.resource.data.percent <= 100
+        && request.resource.data.timeSeconds is int
+        && request.resource.data.timeSeconds >= 0
+        && request.resource.data.timeSeconds <= 86400
+        && request.resource.data.createdAt == request.time;
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
